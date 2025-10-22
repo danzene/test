@@ -1,6 +1,8 @@
+// src/worker/search/equivalents.ts
 import { CanonicalIds, OfferResolved } from '@/shared/types';
 import { MarketItem } from '@/types/product';
 import { dedupeAndSort } from '@/utils/assert';
+import { createAISearchProvider } from './ai-provider';
 import { createSearchProvider } from './provider';
 import { sameProduct, resolveCanonicalIds } from '../ingest/identity';
 import { isAmazonBr, scrapeAmazonBr } from '../ingest/adapters/amazonBr';
@@ -17,9 +19,8 @@ export async function findEquivalentsStrict(
   originalCanonical: CanonicalIds,
   originalTitle: string,
   maxResults: number = 8
-): Promise<{ items: OfferResolved[]; disabled?: boolean; partial?: boolean }> {
+): Promise<{ items: OfferResolved[]; disabled?: boolean; partial?: boolean; method?: string }> {
   
-  // Check cache first
   const canonicalKey = `${originalCanonical.gtin || ''}:${originalCanonical.asin || ''}:${originalCanonical.brand || ''}:${originalCanonical.model || ''}`;
   const cached = getCachedMarketSnapshot(canonicalKey);
   if (cached && cached.length > 0) {
@@ -33,90 +34,112 @@ export async function findEquivalentsStrict(
       imageUrl: null,
       confidence: item.confidence,
     }));
-    return { items: results };
-  }
-  
-  const searchProvider = createSearchProvider(env);
-  
-  // If no SERP_API_KEY, return disabled state
-  if (searchProvider.name === 'fallback' && !env.SERP_API_KEY) {
-    return { items: [], disabled: true };
+    return { items: results, method: 'cache' };
   }
   
   const seenUrls = new Set<string>();
   const marketItems: MarketItem[] = [];
   const startTime = Date.now();
-  const BUDGET_MS = 8000; // Aumentar de 3.8s para 8s
+  const BUDGET_MS = 8000;
   
-  // Build search queries
-  const queries = buildSearchQueries(originalCanonical, originalTitle);
+  let searchUrls: string[] = [];
+  let searchMethod = 'none';
   
-  for (const query of queries) {
-    let searchResults: string[] = [];
-    
+  // PRIORIDADE 1: IA (Groq/Perplexity) - GRATUITO
+  const aiProvider = createAISearchProvider(env);
+  if (aiProvider) {
     try {
-      console.log(`Searching: ${query}`);
-      searchResults = await searchProvider.search(query);
-      if (searchResults.length > 0) {
-        console.log(`Found ${searchResults.length} results`);
+      console.log('🤖 Usando IA para buscar produtos...');
+      const aiResult = await withTimeout(
+        aiProvider.searchProduct(originalCanonical, originalTitle),
+        5000,
+        'ai-search-timeout'
+      );
+      
+      if (aiResult.urls.length > 0) {
+        searchUrls = aiResult.urls;
+        searchMethod = 'ai';
+        console.log(`✅ IA encontrou ${searchUrls.length} URLs`);
       }
     } catch (error) {
-      console.warn(`Search failed:`, error);
-      continue;
+      console.warn('⚠️ IA falhou, usando fallback:', error);
     }
-    
-    // Process up to 6 results per query with time budget
-    for (const url of searchResults.slice(0, 6)) {
-      if (seenUrls.has(url)) continue;
-      if (Date.now() - startTime > BUDGET_MS) break; // Time budget exceeded
-      
-      seenUrls.add(url);
-      
-      try {
-        // Use domain pool and timeout for processing
-        const offer = await domainPool(url, async () => {
-          return await withRetry(async () => {
-            return await withTimeout(
-              processEquivalentUrl(url, originalCanonical, originalTitle),
-              3000, // Aumentar de 1.5s para 3s
-              "process-url-3s"
-            );
-          });
-        });
-        
-        if (offer && offer.confidence >= 0.7 && offer.price && offer.price > 0) {
-          marketItems.push({
-            domain: offer.domain,
-            url: offer.sourceUrl,
-            price: offer.price,
-            currency: offer.currency as "BRL",
-            confidence: offer.confidence,
-            collectedAt: new Date().toISOString(),
-          });
-        }
-      } catch (error) {
-        console.error(`Failed to process URL ${url}:`, error);
-        continue;
-      }
-      
-      if (marketItems.length >= maxResults) break; // Enough results for sync phase
-    }
-    
-    if (Date.now() - startTime > BUDGET_MS || marketItems.length >= maxResults) break;
   }
   
-  // Deduplicate and sort
+  // PRIORIDADE 2: SERP API (fallback)
+  if (searchUrls.length === 0) {
+    const serpProvider = createSearchProvider(env);
+    
+    if (serpProvider.name === 'fallback' && !env.SERP_API_KEY) {
+      return { items: [], disabled: true, method: 'disabled' };
+    }
+    
+    const queries = buildSearchQueries(originalCanonical, originalTitle);
+    
+    for (const query of queries) {
+      try {
+        console.log(`🔍 SERP: ${query}`);
+        const results = await serpProvider.search(query);
+        searchUrls.push(...results);
+        searchMethod = 'serp';
+        
+        if (searchUrls.length >= 12) break;
+      } catch (error) {
+        console.warn('SERP failed:', error);
+      }
+    }
+  }
+  
+  // PRIORIDADE 3: Fallback direto
+  if (searchUrls.length === 0) {
+    searchUrls = buildFallbackUrls(originalCanonical, originalTitle);
+    searchMethod = 'fallback';
+  }
+  
+  // Processar URLs
+  for (const url of searchUrls.slice(0, 12)) {
+    if (seenUrls.has(url)) continue;
+    if (Date.now() - startTime > BUDGET_MS) break;
+    
+    seenUrls.add(url);
+    
+    try {
+      const offer = await domainPool(url, async () => {
+        return await withRetry(async () => {
+          return await withTimeout(
+            processEquivalentUrl(url, originalCanonical, originalTitle),
+            3000,
+            "process-url-3s"
+          );
+        });
+      });
+      
+      if (offer && offer.confidence >= 0.7 && offer.price && offer.price > 0) {
+        marketItems.push({
+          domain: offer.domain,
+          url: offer.sourceUrl,
+          price: offer.price,
+          currency: offer.currency as "BRL",
+          confidence: offer.confidence,
+          collectedAt: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      console.error(`Failed to process URL ${url}:`, error);
+    }
+    
+    if (marketItems.length >= maxResults) break;
+  }
+  
   const dedupedItems = dedupeAndSort(marketItems).slice(0, maxResults);
   
-  // Cache results for future requests
   if (dedupedItems.length > 0) {
     setCachedMarketSnapshot(canonicalKey, dedupedItems);
   }
   
-  // Convert back to OfferResolved format
   const finalResults = dedupedItems.map(item => ({
     productId: 0,
-    title: '', // Will be filled by the adapter when needed
+    title: '',
     price: item.price,
     currency: item.currency,
     domain: item.domain,
@@ -125,39 +148,64 @@ export async function findEquivalentsStrict(
     confidence: item.confidence,
   }));
   
-  const isPartial = finalResults.length < 3; // Less than 3 results indicates partial search
+  const isPartial = finalResults.length < 3;
   
-  // Logging para debug
-  console.log(`Equivalents search - Found: ${marketItems.length}, Time: ${Date.now() - startTime}ms`);
+  console.log(`✅ Found ${finalResults.length} items via ${searchMethod} in ${Date.now() - startTime}ms`);
   
-  return { items: finalResults, partial: isPartial };
+  return { 
+    items: finalResults, 
+    partial: isPartial,
+    method: searchMethod 
+  };
 }
 
 function buildSearchQueries(canonical: CanonicalIds, _title: string): string[] {
   const queries: string[] = [];
-  const siteList = 'site:amazon.com.br OR site:mercadolivre.com.br OR site:magazineluiza.com.br OR site:kabum.com.br OR site:americanas.com.br OR site:shopee.com.br';
+  const siteList = 'site:amazon.com.br OR site:mercadolivre.com.br OR site:magazineluiza.com.br OR site:kabum.com.br';
   
-  // Strategy A: GTIN-based search (highest priority)
   if (canonical.gtin) {
     queries.push(`"${canonical.gtin}" (${siteList})`);
   }
   
-  // Strategy B: Brand + Model search  
   if (canonical.brand && canonical.model) {
     queries.push(`"${canonical.brand} ${canonical.model}" (${siteList})`);
   }
   
-  // Strategy C: Brand + MPN search
-  if (canonical.brand && canonical.mpn) {
-    queries.push(`"${canonical.brand}" "${canonical.mpn}" (${siteList})`);
-  }
-  
-  // Strategy D: ASIN search (Amazon specific)
   if (canonical.asin) {
     queries.push(`"${canonical.asin}" site:amazon.com.br`);
   }
   
-  return queries.filter(Boolean);
+  return queries;
+}
+
+function buildFallbackUrls(canonical: CanonicalIds, title: string): string[] {
+  const urls: string[] = [];
+  
+  let searchTerm = '';
+  
+  if (canonical.gtin) {
+    searchTerm = canonical.gtin;
+  } else if (canonical.brand && canonical.model) {
+    searchTerm = `${canonical.brand} ${canonical.model}`;
+  } else {
+    searchTerm = title
+      .toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .split(' ')
+      .filter(w => w.length > 3)
+      .slice(0, 3)
+      .join(' ');
+  }
+  
+  const encoded = encodeURIComponent(searchTerm);
+  
+  urls.push(`https://www.amazon.com.br/s?k=${encoded}`);
+  urls.push(`https://lista.mercadolivre.com.br/${encoded}`);
+  urls.push(`https://www.magazineluiza.com.br/busca/${encoded}`);
+  urls.push(`https://www.kabum.com.br/busca/${encoded}`);
+  urls.push(`https://www.americanas.com.br/busca/${encoded}`);
+  
+  return urls;
 }
 
 async function processEquivalentUrl(
@@ -166,7 +214,6 @@ async function processEquivalentUrl(
   sourceTitle: string
 ): Promise<OfferResolved | null> {
   try {
-    // Determine adapter based on domain
     let productData;
     
     if (isAmazonBr(url)) {
@@ -181,27 +228,23 @@ async function processEquivalentUrl(
       productData = await scrapeUniversal(url);
     }
     
-    // Resolve canonical IDs for the candidate product
     const targetCanonical = resolveCanonicalIds(productData, url);
     const sourceIdentity = { canonical: sourceCanonical, confidence: 1.0 };
     const targetIdentity = { canonical: targetCanonical, confidence: 1.0 };
     
-    // Check if it's the same product
     const matchResult = sameProduct(sourceIdentity, targetIdentity, sourceTitle, productData.title);
     if (!matchResult.ok) {
       return null;
     }
     
-    // Only return if price is valid
     if (!productData.price || productData.price <= 0) {
       return null;
     }
     
-    // Extract domain for display
     const domain = new URL(url).hostname.replace('www.', '');
     
     return {
-      productId: 0, // Will be set when saved to database
+      productId: 0,
       title: productData.title,
       price: productData.price,
       currency: productData.currency,

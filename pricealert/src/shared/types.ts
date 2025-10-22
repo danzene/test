@@ -443,3 +443,13 @@ export const PLAN_LIMITS = {
     alertHistory: 365, // days
   },
 } as const;
+
+// AI Search response type
+export const AISearchResponseSchema = z.object({
+  items: z.array(OfferResolvedSchema),
+  disabled: z.boolean().optional(),
+  partial: z.boolean().optional(),
+  method: z.enum(['ai', 'serp', 'fallback', 'cache', 'none']).optional(),
+});
+
+export type AISearchResponse = z.infer<typeof AISearchResponseSchema>;
