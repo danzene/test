@@ -1,0 +1,21 @@
+
+DROP INDEX idx_search_logs_success;
+DROP INDEX idx_search_logs_user_id_created_at;
+DROP INDEX idx_products_created_at;
+DROP INDEX idx_products_last_price;
+DROP INDEX idx_products_brand;
+DROP INDEX idx_alerts_target_price;
+DROP INDEX idx_alerts_product_id_is_active;
+DROP INDEX idx_alerts_user_id_is_active;
+DROP INDEX idx_price_points_price;
+DROP INDEX idx_price_points_product_id_captured_at;
+DROP INDEX idx_product_category_mappings_category_id;
+DROP INDEX idx_product_category_mappings_product_id;
+DROP INDEX idx_product_categories_slug;
+DROP INDEX idx_wishlists_product_id;
+DROP INDEX idx_wishlists_user_id;
+DROP INDEX idx_user_preferences_user_id;
+DROP INDEX idx_alert_history_sent_at;
+DROP INDEX idx_alert_history_product_id;
+DROP INDEX idx_alert_history_user_id;
+DROP INDEX idx_alert_history_alert_id;
