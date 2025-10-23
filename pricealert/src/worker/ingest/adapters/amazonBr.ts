@@ -16,32 +16,89 @@ function extractAsin(html: string, url: string): string | null {
 }
 
 function extractBuyboxPrice(html: string): number | null {
-  // Padrão 1: apex_desktop
-  const block = html.match(/<div[^>]+id=["'](apex_desktop|corePriceDisplay_desktop_feature_div)["'][\s\S]*?<\/div>/i)?.[0];
+  console.log('🔍 Extracting price from Amazon HTML...');
+  
+  // Padrão 1: apex_desktop/corePriceDisplay_desktop_feature_div
+  const blockRegex = /<div[^>]+id=["'](apex_desktop|corePriceDisplay_desktop_feature_div)["'][\s\S]*?<\/div>/i;
+  const block = html.match(blockRegex)?.[0];
   if (block) {
+    console.log('📦 Found price block:', block.substring(0, 200) + '...');
     const spans = [...block.matchAll(/<span[^>]+class="[^"]*\ba-offscreen\b[^"]*"[^>]*>([^<]+)<\/span>/gi)]
       .map(m => (m[1] || "").trim())
-      .filter(t => !/de\s*R\$|juros|parcela/i.test(t));
+      .filter(t => {
+        const isInstallment = /de\s*R\$|juros|parcela|em\s+\d+x/i.test(t);
+        console.log(`💰 Span text: "${t}" - installment: ${isInstallment}`);
+        return !isInstallment;
+      });
+    
     for (const t of spans) {
       const v = parsePriceBRL(t);
-      if (v) return v;
+      if (v) {
+        console.log(`✅ Price extracted from span: R$ ${v}`);
+        return v;
+      }
     }
   }
   
-  // ✅ NOVO: Padrão 2 - Preço em data attributes
+  // Padrão 2: Preço em data attributes
   const dataPrice = html.match(/data-a-color="price"[^>]*>([^<]+)<\/span>/i)?.[1];
   if (dataPrice) {
+    console.log(`🏷️ Found data-price: "${dataPrice}"`);
     const v = parsePriceBRL(dataPrice);
-    if (v) return v;
+    if (v) {
+      console.log(`✅ Price extracted from data-attr: R$ ${v}`);
+      return v;
+    }
   }
   
-  // ✅ NOVO: Padrão 3 - Preço no título da página (último recurso)
+  // Padrão 3: Múltiplos seletores alternativos
+  const alternativeSelectors = [
+    /<span[^>]*class="[^"]*a-price-whole[^"]*"[^>]*>([^<]+)<\/span>/g,
+    /<span[^>]*class="[^"]*a-price[^"]*"[^>]*>([^<]+)<\/span>/g,
+    /<div[^>]*class="[^"]*a-section[^"]*"[^>]*>[\s\S]*?R\$\s*([\d\.,]+)[\s\S]*?<\/div>/g,
+  ];
+  
+  for (const selector of alternativeSelectors) {
+    const matches = [...html.matchAll(selector)];
+    for (const match of matches) {
+      const text = match[1]?.trim();
+      if (text && !(/de\s*R\$|juros|parcela|em\s+\d+x/i.test(text))) {
+        const v = parsePriceBRL(text.includes('R$') ? text : `R$ ${text}`);
+        if (v) {
+          console.log(`✅ Price extracted from alternative selector: R$ ${v}`);
+          return v;
+        }
+      }
+    }
+  }
+  
+  // Padrão 4: Preço no título da página (último recurso)
   const titlePrice = html.match(/<title>[^<]*R\$\s*([\d\.,]+)[^<]*<\/title>/i)?.[1];
   if (titlePrice) {
+    console.log(`📑 Found title price: "${titlePrice}"`);
     const v = parsePriceBRL(`R$ ${titlePrice}`);
-    if (v) return v;
+    if (v) {
+      console.log(`✅ Price extracted from title: R$ ${v}`);
+      return v;
+    }
   }
   
+  // Padrão 5: Busca geral por preços no HTML (último recurso)
+  const priceMatches = html.match(/R\$\s*[\d\.,]+/g);
+  if (priceMatches) {
+    console.log(`🔍 Found ${priceMatches.length} price-like patterns`);
+    for (const priceText of priceMatches) {
+      if (!/de\s*R\$|juros|parcela|em\s+\d+x/i.test(priceText)) {
+        const v = parsePriceBRL(priceText);
+        if (v && v > 1 && v < 100000) { // Preço razoável entre R$ 1 e R$ 100.000
+          console.log(`✅ Price extracted from general search: R$ ${v}`);
+          return v;
+        }
+      }
+    }
+  }
+  
+  console.log('❌ No valid price found in HTML');
   return null;
 }
 

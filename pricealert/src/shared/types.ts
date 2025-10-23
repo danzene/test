@@ -453,3 +453,32 @@ export const AISearchResponseSchema = z.object({
 });
 
 export type AISearchResponse = z.infer<typeof AISearchResponseSchema>;
+
+// New v2.0 - Product Search Types
+export const ProductSearchRequestSchema = z.object({
+  query: z.string().min(2).max(200),
+  maxResults: z.number().min(1).max(10).default(5),
+});
+
+export const ProductSearchResultSchema = z.object({
+  title: z.string(),
+  price: z.number().positive(),
+  currency: z.string().default('BRL'),
+  domain: z.string(),
+  url: z.string().url(),
+  imageUrl: z.string().url().nullable(),
+  confidence: z.number().min(0).max(1),
+});
+
+export const SearchProductsResponseSchema = z.object({
+  ok: z.boolean(),
+  query: z.string(),
+  results: z.array(ProductSearchResultSchema),
+  totalFound: z.number(),
+  searchMethod: z.enum(['ai', 'serp', 'fallback', 'none']),
+  error: z.string().optional(),
+});
+
+export type ProductSearchRequest = z.infer<typeof ProductSearchRequestSchema>;
+export type ProductSearchResult = z.infer<typeof ProductSearchResultSchema>;
+export type SearchProductsResponse = z.infer<typeof SearchProductsResponseSchema>;

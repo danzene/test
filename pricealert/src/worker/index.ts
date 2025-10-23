@@ -22,6 +22,8 @@ import {
 interface AppEnv extends Env {
   MOCHA_USERS_SERVICE_API_URL: string;
   MOCHA_USERS_SERVICE_API_KEY: string;
+  GROQ_API_KEY?: string;
+  PERPLEXITY_API_KEY?: string;
 }
 
 const app = new Hono<{ Bindings: AppEnv }>();
@@ -539,6 +541,99 @@ app.post("/api/ingest", authMiddleware, async (c) => {
   }
 });
 
+// NEW: Search for products by name (v2.0)
+interface SearchProductsRequest {
+  query: string; // Ex: "iPhone 15 Pro"
+  maxResults?: number; // Default: 5
+}
+
+interface ProductSearchResult {
+  id?: number;
+  title: string;
+  price: number;
+  currency: string;
+  domain: string;
+  url: string;
+  imageUrl?: string;
+  confidence: number;
+}
+
+interface SearchProductsResponse {
+  ok: boolean;
+  query: string;
+  results: ProductSearchResult[];
+  totalFound: number;
+  searchMethod: 'ai' | 'serp' | 'fallback';
+  error?: string;
+}
+
+app.post("/api/search-products", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) {
+    return c.json({ ok: false, error: "User not found" }, 401);
+  }
+
+  const body = await c.req.json();
+  const query = body.query?.trim();
+
+  if (!query || query.length < 2) {
+    return c.json({ 
+      ok: false, 
+      error: "Query must have at least 2 characters" 
+    }, 400);
+  }
+
+  const limitCheck = await checkUserLimits(c, user.id, 'search');
+  if (!limitCheck.allowed) {
+    return c.json({ ok: false, error: limitCheck.reason }, 429);
+  }
+
+  try {
+    const { hybridSearch } = await import('./search/hybrid-search');
+    
+    console.log(`🔍 Searching products: "${query}"`);
+    
+    const startTime = Date.now();
+    const results = await hybridSearch(
+      c.env.SERP_API_KEY || '', // Pode estar vazio - mock vai funcionar mesmo assim
+      query,
+      body.maxResults || 5
+    );
+    
+    const duration = Date.now() - startTime;
+    
+    console.log(`✅ Search completed in ${duration}ms, found ${results.length} products`);
+    
+    if (results.length === 0) {
+      return c.json({
+        ok: true,
+        query,
+        results: [],
+        totalFound: 0,
+        warning: 'No products found. Try: "PlayStation 5", "Xbox Series X", or "iPhone 15 Pro"',
+      });
+    }
+
+    await logSearch(c, user.id, query, true);
+    
+    return c.json({
+      ok: true,
+      query,
+      results: results,
+      totalFound: results.length,
+    });
+
+  } catch (error) {
+    console.error('Search error:', error);
+    await logSearch(c, user.id, query, false);
+    
+    return c.json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Search failed',
+    }, 500);
+  }
+});
+
 // Enhanced product details endpoint with real 90d stats
 app.get("/api/product/:id", async (c) => {
   const productId = parseInt(c.req.param('id'));
@@ -607,7 +702,7 @@ app.get("/api/product/:id", async (c) => {
 
   // Melhorar lógica de "collecting"
   const verified = Boolean(product.verified || product.canonical_gtin || product.canonical_asin);
-  const collecting = !product.last_collected_at || (realPricePoints.length === 0 && Date.now() - new Date(product.created_at).getTime() < 300000); // 5 min window
+  const collecting = !product.last_collected_at || (realPricePoints.length === 0 && Date.now() - new Date(String(product.created_at)).getTime() < 300000); // 5 min window
   
   const response = {
     ok: true,
@@ -635,6 +730,11 @@ app.get("/api/product/:id", async (c) => {
 app.get("/api/product/:id/market", async (c) => {
   const productId = parseInt(c.req.param('id'));
   
+  console.log('🔍 Market snapshot requested for product:', productId);
+  console.log('  Environment check:');
+  console.log('    GROQ_API_KEY:', !!c.env.GROQ_API_KEY ? '✅ configured' : '❌ missing');
+  console.log('    SERP_API_KEY:', !!c.env.SERP_API_KEY ? '✅ configured' : '❌ missing');
+  
   const product = await c.env.DB.prepare(
     "SELECT * FROM products WHERE id = ?"
   ).bind(productId).first();
@@ -642,6 +742,8 @@ app.get("/api/product/:id/market", async (c) => {
   if (!product) {
     return c.json({ error: "Product not found" }, 404);
   }
+
+  console.log('  Product:', String(product.title).substring(0, 50));
 
   try {
     // Import equivalents search
@@ -656,13 +758,28 @@ app.get("/api/product/:id/market", async (c) => {
       model: (product.model as string) || null,
     };
     
+    console.log('  Canonical IDs:', {
+      gtin: canonical.gtin ? '✅' : '❌',
+      asin: canonical.asin ? '✅' : '❌',
+      brand: canonical.brand ? '✅' : '❌',
+      model: canonical.model ? '✅' : '❌',
+    });
+    
     // Find equivalent products across stores with 3.8s budget
+    console.log('  Calling findEquivalentsStrict()...');
     const equivalentsResult = await findEquivalentsStrict(
       c.env,
       canonical,
       String(product.title || ''),
       8
     );
+    
+    console.log('  ✅ findEquivalentsStrict() completed:', {
+      items: equivalentsResult.items.length,
+      method: equivalentsResult.method,
+      partial: equivalentsResult.partial,
+      disabled: equivalentsResult.disabled
+    });
     
     if (equivalentsResult.disabled) {
       return c.json({
@@ -924,7 +1041,7 @@ app.delete("/api/alerts/:id", authMiddleware, async (c) => {
 app.get("/api/health", async (c) => {
   return c.json({
     status: "healthy",
-    version: "1.0.8",
+    version: "1.0.8-serp",
     timestamp: new Date().toISOString(),
     features: [
       "universal_url_ingestion",
@@ -936,9 +1053,195 @@ app.get("/api/health", async (c) => {
       "timeout_protection",
       "domain_pool_limiting",
       "performance_cache",
-      "instant_price_points"
-    ]
+      "instant_price_points",
+      "groq_ai_integration",
+      "serp_api_integration",
+      "hybrid_product_search"
+    ],
+    search_providers: {
+      groq: !!c.env.GROQ_API_KEY,
+      perplexity: !!c.env.PERPLEXITY_API_KEY,
+      serp_api: !!c.env.SERP_API_KEY
+    }
   });
+});
+
+// Debug endpoint 1: Quick Groq check
+app.get("/api/debug/groq-check", async (c) => {
+  const apiKey = c.env.GROQ_API_KEY;
+  
+  return c.json({
+    exists: !!apiKey,
+    length: apiKey?.length || 0,
+    prefix: apiKey ? `${apiKey.substring(0, 20)}...` : 'none',
+    suffix: apiKey ? `...${apiKey.substring(apiKey.length - 10)}` : 'none',
+    format_ok: apiKey ? apiKey.startsWith('gsk_') && apiKey.length === 56 : false,
+    env_check: {
+      GROQ_API_KEY: !!apiKey,
+      PERPLEXITY_API_KEY: !!c.env.PERPLEXITY_API_KEY,
+      SERP_API_KEY: !!c.env.SERP_API_KEY,
+    }
+  });
+});
+
+// Debug endpoint 2: Test Groq API directly
+app.get("/api/debug/groq-test", async (c) => {
+  console.log('🧪 Testing Groq API...');
+  
+  const apiKey = c.env.GROQ_API_KEY;
+  
+  console.log('  GROQ_API_KEY exists:', !!apiKey);
+  console.log('  GROQ_API_KEY length:', apiKey?.length || 0);
+  console.log('  GROQ_API_KEY preview:', apiKey ? `${apiKey.substring(0, 20)}...` : 'none');
+  
+  if (!apiKey) {
+    return c.json({ 
+      ok: false,
+      error: 'GROQ_API_KEY not configured',
+      env_check: {
+        GROQ_API_KEY: false,
+        PERPLEXITY_API_KEY: !!c.env.PERPLEXITY_API_KEY,
+        SERP_API_KEY: !!c.env.SERP_API_KEY,
+      }
+    }, 400);
+  }
+  
+  try {
+    console.log('  Calling Groq API...');
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-70b-versatile',
+        messages: [
+          {
+            role: 'user',
+            content: 'Say "Groq AI is working for PriceAlert+" - be brief'
+          }
+        ],
+        temperature: 0.1,
+        max_tokens: 15,
+      }),
+    });
+
+    console.log('  Groq API status:', response.status);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('  Groq API error:', errorText);
+      return c.json({
+        ok: false,
+        status: response.status,
+        error: errorText,
+        full_response: errorText,
+      }, 500);
+    }
+    
+    const data = await response.json() as any;
+    console.log('  ✅ Groq API success');
+    
+    return c.json({
+      ok: true,
+      status: response.status,
+      success: true,
+      message: data.choices?.[0]?.message?.content || 'No response',
+      model: 'llama-3.1-70b-versatile',
+      groq_response: data
+    });
+  } catch (error) {
+    console.error('  ❌ Groq test failed:', error);
+    return c.json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      type: error instanceof Error ? error.constructor.name : typeof error,
+      stack: error instanceof Error ? error.stack : undefined
+    }, 500);
+  }
+});
+
+// New debug endpoint: Quick Groq check
+app.get("/api/debug/groq-check", async (c) => {
+  const apiKey = c.env.GROQ_API_KEY;
+  
+  return c.json({
+    exists: !!apiKey,
+    length: apiKey?.length || 0,
+    prefix: apiKey ? `${apiKey.substring(0, 10)}...` : 'none',
+    format_ok: apiKey ? apiKey.startsWith('gsk_') && apiKey.length === 56 : false,
+    env_check: {
+      GROQ_API_KEY: !!apiKey,
+      PERPLEXITY_API_KEY: !!c.env.PERPLEXITY_API_KEY,
+      SERP_API_KEY: !!c.env.SERP_API_KEY,
+    }
+  });
+});
+
+// New debug endpoint: Test SerpAPI
+app.get("/api/debug/serp-test", async (c) => {
+  const query = c.req.query('q') || 'iPhone 15';
+  const apiKey = c.env.SERP_API_KEY;
+  
+  const { testSerpAPI } = await import('./debug/serp-test');
+  const result = await testSerpAPI(apiKey, query);
+  
+  return c.json(result);
+});
+
+// New debug endpoint: Test real product search
+app.get("/api/debug/groq-product-test", async (c) => {
+  const apiKey = c.env.GROQ_API_KEY;
+  
+  if (!apiKey) {
+    return c.json({ error: 'GROQ_API_KEY not configured' }, 400);
+  }
+
+  try {
+    console.log('🧪 Testing Groq product search...');
+    
+    // Test with a real product scenario
+    const testCanonical = {
+      gtin: null,
+      asin: 'B0DGT89KW1',
+      mpn: null,
+      brand: null,
+      model: null,
+    };
+    const testTitle = 'Quebrando o gelo - Suce';
+    
+    const { GroqSearchProvider } = await import('./search/ai-provider');
+    const provider = new GroqSearchProvider(apiKey);
+    
+    console.log('  Testing with:', { testTitle, testCanonical });
+    
+    const result = await provider.searchProduct(testCanonical, testTitle);
+    
+    console.log('  ✅ Groq product search completed:', {
+      urls_found: result.urls.length,
+      confidence: result.confidence
+    });
+    
+    return c.json({
+      ok: true,
+      test_input: { testTitle, testCanonical },
+      result: {
+        urls_count: result.urls.length,
+        urls: result.urls,
+        confidence: result.confidence,
+        reasoning_preview: result.reasoning?.substring(0, 200) + '...' || 'none'
+      },
+      message: 'Groq product search is working!'
+    });
+  } catch (error) {
+    console.error('  ❌ Groq product test failed:', error);
+    return c.json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      type: error instanceof Error ? error.constructor.name : typeof error
+    }, 500);
+  }
 });
 
 // User preferences endpoints 
@@ -1109,7 +1412,7 @@ app.get("/api/me/dashboard", authMiddleware, async (c) => {
     ).bind(user.id).first()
   ]);
 
-  const wishlistCount = wishlistCountResult ? Number((wishlistCountResult as any).count || 0) : 0;
+  const wishlistCount = wishlistCountResult ? Number(String((wishlistCountResult as any).count || 0)) : 0;
 
   return c.json({
     alerts: alerts.results || [],

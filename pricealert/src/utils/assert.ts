@@ -9,20 +9,85 @@ export function notNull<T>(v: T | null | undefined, msg = "value is null"): T {
 
 /** Converte string "R$ 1.234,56" em número 1234.56; retorna null se inválido */
 export function parsePriceBRL(input?: string | null): number | null {
-  if (!input) return null;
+  if (!input || typeof input !== 'string') return null;
+  
+  console.log(`💰 Parsing price: "${input}"`);
   
   // Skip prices with installment indicators
-  if (/\d+x\s+de|\d+x\s+R\$|em\s+\d+x|juros/i.test(input)) {
+  if (/\d+x\s+de|\d+x\s+R\$|em\s+\d+x|juros|parcela/i.test(input)) {
+    console.log('❌ Rejected: installment detected');
     return null;
   }
   
-  const s = input
-    .replace(/\s+/g, " ")
-    .replace(/de\s*R\$\s*\d{1,3}(\.\d{3})*,\d{2}/i, "");
-  const m = s.match(/R\$\s*([\d\.\,]+)/);
-  if (!m) return null;
-  const v = Number(m[1].replace(/\./g, "").replace(",", "."));
-  return Number.isFinite(v) && v > 0 ? Number(v.toFixed(2)) : null;
+  // Handle "de R$ X por R$ Y" - extract the final price
+  const finalPriceMatch = input.match(/por\s+R\$\s*([\d\.\,]+)/i);
+  if (finalPriceMatch) {
+    console.log(`✅ Found "por R$" pattern: ${finalPriceMatch[1]}`);
+    const v = Number(finalPriceMatch[1].replace(/\./g, "").replace(",", "."));
+    return Number.isFinite(v) && v > 0 ? Number(v.toFixed(2)) : null;
+  }
+  
+  // Skip "de R$" without "por"
+  if (/de\s+R\$/i.test(input) && !/por\s+R\$/i.test(input)) {
+    console.log('❌ Rejected: "de R$" without "por"');
+    return null;
+  }
+  
+  // Standard price extraction
+  const priceMatch = input.match(/R\$\s*([\d\.\,]+)/i);
+  if (!priceMatch) {
+    console.log('❌ No R$ pattern found');
+    return null;
+  }
+  
+  const priceStr = priceMatch[1];
+  let numericValue: number;
+  
+  // Handle different Brazilian number formats
+  if (priceStr.includes(',') && priceStr.includes('.')) {
+    // Format: 1.299,99
+    const parts = priceStr.split(',');
+    if (parts.length === 2) {
+      const integerPart = parts[0].replace(/\./g, '');
+      const decimalPart = parts[1];
+      numericValue = parseFloat(`${integerPart}.${decimalPart}`);
+    } else {
+      console.log('❌ Invalid format with both , and .');
+      return null;
+    }
+  } else if (priceStr.includes(',')) {
+    // Format: 1299,99 or 1.299,99
+    const lastCommaIndex = priceStr.lastIndexOf(',');
+    const afterComma = priceStr.substring(lastCommaIndex + 1);
+    
+    if (afterComma.length === 2) {
+      // Decimal comma: 1299,99
+      const beforeComma = priceStr.substring(0, lastCommaIndex).replace(/\./g, '');
+      numericValue = parseFloat(`${beforeComma}.${afterComma}`);
+    } else {
+      // Thousands separator: 1.299,99 -> already handled above
+      numericValue = parseFloat(priceStr.replace(/\./g, '').replace(',', '.'));
+    }
+  } else if (priceStr.includes('.')) {
+    // Could be 1299.99 (US format) or 1.299 (BR thousands)
+    const lastDotIndex = priceStr.lastIndexOf('.');
+    const afterDot = priceStr.substring(lastDotIndex + 1);
+    
+    if (afterDot.length === 2) {
+      // Decimal dot: 1299.99
+      numericValue = parseFloat(priceStr);
+    } else {
+      // Thousands separator: 1.299
+      numericValue = parseFloat(priceStr.replace(/\./g, ''));
+    }
+  } else {
+    // No separators: 1299
+    numericValue = parseFloat(priceStr);
+  }
+  
+  const result = Number.isFinite(numericValue) && numericValue > 0 ? Number(numericValue.toFixed(2)) : null;
+  console.log(`💰 Parsed "${input}" -> ${result}`);
+  return result;
 }
 
 import { MarketItem } from '@/types/product';

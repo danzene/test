@@ -57,7 +57,7 @@ export const CACHE_KEYS = {
 
 export const CACHE_TTL = {
   PRODUCT_RAW: 24 * 60 * 60 * 1000, // 24 hours
-  MARKET_SNAPSHOT: 60 * 60 * 1000,  // 1 hour  
+  MARKET_SNAPSHOT: 30 * 60 * 1000,  // 30 minutes (reduzido para permitir retry rápido)
   HTML_CONTENT: 60 * 60 * 1000,     // 1 hour
 } as const;
 

@@ -88,9 +88,9 @@ export default function PriceChart({ pricePoints, stats90d, currency = 'BRL', ta
       </div>
 
       {pricePoints.length > 0 ? (
-        <div className="h-64">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={chartData}>
+        <div className="h-64" style={{ minHeight: '256px', minWidth: '300px' }}>
+          <ResponsiveContainer width="100%" height="100%" minWidth={300} minHeight={256}>
+            <LineChart data={chartData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" className="opacity-30" />
               <XAxis 
                 dataKey="formattedDate"
